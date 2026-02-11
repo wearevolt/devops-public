@@ -2,67 +2,62 @@
 set -euo pipefail
 
 # WeareVolt Internal AWS SSO setup script
-# Configures AWS SSO profile for WeareVolt internal accounts (spice, pjc, alex, internal).
-# SSO portal: https://wearevolt.awsapps.com/start/#/
+# Configures AWS SSO profile for WeareVolt internal accounts.
+# Automatically picks the highest-privilege role available to the user.
+# Usage: ./setup-internal-aws-sso.sh
 
 SSO_START_URL="https://wearevolt.awsapps.com/start/#/"
 SSO_REGION="us-east-1"
 AWS_REGION="us-east-1"
-SSO_SESSION_NAME="wearevolt-internal"
+SESSION_NAME="wearevolt-internal"
 
-# Account IDs (from management/wearevolt/.../idc/accounts.yaml); override via env if needed
-ACCOUNT_ID_SPICE="${ACCOUNT_ID_SPICE:-820345161825}"      # Spice
-ACCOUNT_ID_PJC="${ACCOUNT_ID_PJC:-646282686055}"         # WAV-PJC
-ACCOUNT_ID_ALEX="${ACCOUNT_ID_ALEX:-631170821846}"       # Alex
-ACCOUNT_ID_INTERNAL="${ACCOUNT_ID_INTERNAL:-539247483493}" # WAV-COMMON
+# Role priority: highest privilege first
+ROLE_PRIORITY=(
+    "AdministratorAccess"
+    "PowerUserAccess"
+    "DataUserAccess"
+)
 
-# ── Profile selection ─────────────────────────────────────────────────
+# ── Account selection ──────────────────────────────────────────────────
 echo ""
 echo "WeareVolt Internal AWS SSO Setup"
-echo "==============================="
+echo "================================"
 echo ""
-echo "Select profile:"
-echo "  1) spice"
-echo "  2) pjc"
-echo "  3) alex"
-echo "  4) internal"
+echo "Select account:"
+echo "  1) Spice        (820345161825)"
+echo "  2) PJC          (646282686055)"
+echo "  3) Alex         (631170821846)"
+echo "  4) Internal     (539247483493)"
+echo "  5) Curation     (134726541233)"
 echo ""
-read -rp "Enter number [1-4]: " choice
+read -rp "Enter number [1-5]: " env_choice
 
-case "$choice" in
+case "$env_choice" in
     1)
         PROFILE_NAME="spice"
-        ACCOUNT_ID="${ACCOUNT_ID_SPICE}"
+        ACCOUNT_ID="820345161825"
         ;;
     2)
         PROFILE_NAME="pjc"
-        ACCOUNT_ID="${ACCOUNT_ID_PJC}"
+        ACCOUNT_ID="646282686055"
         ;;
     3)
         PROFILE_NAME="alex"
-        ACCOUNT_ID="${ACCOUNT_ID_ALEX}"
+        ACCOUNT_ID="631170821846"
         ;;
     4)
         PROFILE_NAME="internal"
-        ACCOUNT_ID="${ACCOUNT_ID_INTERNAL}"
+        ACCOUNT_ID="539247483493"
+        ;;
+    5)
+        PROFILE_NAME="curation"
+        ACCOUNT_ID="134726541233"
         ;;
     *)
-        echo "ERROR: Invalid choice. Expected 1, 2, 3, or 4."
+        echo "ERROR: Invalid choice. Expected 1-5."
         exit 1
         ;;
 esac
-
-if [ -z "${ACCOUNT_ID}" ]; then
-    echo ""
-    echo "ERROR: Account ID for profile '$PROFILE_NAME' is not set."
-    echo "Set it via environment variable (e.g. ACCOUNT_ID_SPICE=123456789012) or edit this script."
-    exit 1
-fi
-
-echo ""
-echo "Profile    : $PROFILE_NAME"
-echo "Account ID : $ACCOUNT_ID"
-echo ""
 
 # ── Check prerequisites ───────────────────────────────────────────────
 if ! command -v aws &>/dev/null; then
@@ -70,20 +65,17 @@ if ! command -v aws &>/dev/null; then
     exit 1
 fi
 
-# ── Configure SSO profile ─────────────────────────────────────────────
-echo "Configuring AWS SSO profile '$PROFILE_NAME'..."
-echo ""
-
+# ── Write SSO session config (needed for login) ───────────────────────
 AWS_CONFIG_FILE="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
 mkdir -p "$(dirname "$AWS_CONFIG_FILE")"
 
-# Remove existing profile block for this profile only (keep sso-session)
+# Clean up old session block if exists
 if [ -f "$AWS_CONFIG_FILE" ]; then
     python3 -c "
 import re
 
-config = open('$AWS_CONFIG_FILE').read()
-config = re.sub(r'\[profile $PROFILE_NAME\]\n(?:[^\[]*\n)*', '', config)
+config = open('${AWS_CONFIG_FILE}').read()
+config = re.sub(r'\[sso-session ${SESSION_NAME}\]\n(?:[^\[]*\n)*', '', config)
 config = re.sub(r'\n{3,}', '\n\n', config).strip()
 print(config)
 " > "${AWS_CONFIG_FILE}.tmp" 2>/dev/null || true
@@ -94,36 +86,132 @@ print(config)
     fi
 fi
 
-# Append new SSO session (only if not already present) and profile
-if ! grep -q "\[sso-session $SSO_SESSION_NAME\]" "$AWS_CONFIG_FILE" 2>/dev/null; then
-    cat >> "$AWS_CONFIG_FILE" <<EOF
+cat >> "$AWS_CONFIG_FILE" <<EOF
 
-[sso-session $SSO_SESSION_NAME]
-sso_start_url = $SSO_START_URL
-sso_region = $SSO_REGION
+[sso-session ${SESSION_NAME}]
+sso_start_url = ${SSO_START_URL}
+sso_region = ${SSO_REGION}
 sso_registration_scopes = sso:account:access
 EOF
+
+# ── SSO Login ──────────────────────────────────────────────────────────
+echo ""
+echo "Logging in via AWS SSO (a browser window will open)..."
+aws sso login --sso-session "$SESSION_NAME"
+
+echo ""
+echo "OK: SSO login successful."
+echo ""
+
+# ── Get SSO access token from cache ───────────────────────────────────
+SSO_CACHE_DIR="$HOME/.aws/sso/cache"
+ACCESS_TOKEN=""
+
+if [ -d "$SSO_CACHE_DIR" ]; then
+    ACCESS_TOKEN=$(python3 -c "
+import json, glob, os, sys
+from datetime import datetime, timezone
+
+cache_dir = '${SSO_CACHE_DIR}'
+best_token = None
+best_time = None
+
+for f in glob.glob(os.path.join(cache_dir, '*.json')):
+    try:
+        data = json.load(open(f))
+        if 'accessToken' not in data:
+            continue
+        if 'startUrl' in data and data['startUrl'] != '${SSO_START_URL}':
+            continue
+        expires = data.get('expiresAt', '')
+        if expires:
+            exp_time = datetime.fromisoformat(expires.replace('Z', '+00:00'))
+            if exp_time < datetime.now(timezone.utc):
+                continue
+            if best_time is None or exp_time > best_time:
+                best_time = exp_time
+                best_token = data['accessToken']
+    except Exception:
+        continue
+
+if best_token:
+    print(best_token)
+else:
+    sys.exit(1)
+" 2>/dev/null) || true
+fi
+
+if [ -z "$ACCESS_TOKEN" ]; then
+    echo "ERROR: Could not retrieve SSO access token. Please try again."
+    exit 1
+fi
+
+# ── Discover available roles ──────────────────────────────────────────
+echo "Discovering available roles for account $ACCOUNT_ID..."
+
+AVAILABLE_ROLES=$(aws sso list-account-roles \
+    --account-id "$ACCOUNT_ID" \
+    --access-token "$ACCESS_TOKEN" \
+    --region "$SSO_REGION" \
+    --query 'roleList[].roleName' \
+    --output text 2>/dev/null) || true
+
+if [ -z "$AVAILABLE_ROLES" ]; then
+    echo "ERROR: No roles available for account $ACCOUNT_ID."
+    echo "       You may not have access to the '$PROFILE_NAME' account."
+    echo "       Contact DevOps to request access."
+    exit 1
+fi
+
+echo "Available roles: $AVAILABLE_ROLES"
+
+# ── Pick the best role by priority ────────────────────────────────────
+SSO_ROLE=""
+for role in "${ROLE_PRIORITY[@]}"; do
+    if echo "$AVAILABLE_ROLES" | grep -qw "$role"; then
+        SSO_ROLE="$role"
+        break
+    fi
+done
+
+if [ -z "$SSO_ROLE" ]; then
+    SSO_ROLE=$(echo "$AVAILABLE_ROLES" | awk '{print $1}')
+fi
+
+echo "Selected role  : $SSO_ROLE"
+echo ""
+
+# ── Write final profile to AWS config ─────────────────────────────────
+echo "Configuring AWS CLI profile '$PROFILE_NAME'..."
+
+# Remove old profile block if exists
+if [ -f "$AWS_CONFIG_FILE" ]; then
+    python3 -c "
+import re
+
+config = open('${AWS_CONFIG_FILE}').read()
+config = re.sub(r'\[profile ${PROFILE_NAME}\]\n(?:[^\[]*\n)*', '', config)
+config = re.sub(r'\n{3,}', '\n\n', config).strip()
+print(config)
+" > "${AWS_CONFIG_FILE}.tmp" 2>/dev/null || true
+    if [ -s "${AWS_CONFIG_FILE}.tmp" ]; then
+        mv "${AWS_CONFIG_FILE}.tmp" "$AWS_CONFIG_FILE"
+    else
+        rm -f "${AWS_CONFIG_FILE}.tmp"
+    fi
 fi
 
 cat >> "$AWS_CONFIG_FILE" <<EOF
 
-[profile $PROFILE_NAME]
-sso_session = $SSO_SESSION_NAME
-sso_account_id = $ACCOUNT_ID
-sso_role_name = AdministratorAccess
-region = $AWS_REGION
+[profile ${PROFILE_NAME}]
+sso_session = ${SESSION_NAME}
+sso_account_id = ${ACCOUNT_ID}
+sso_role_name = ${SSO_ROLE}
+region = ${AWS_REGION}
 output = json
 EOF
 
 echo "OK: Profile '$PROFILE_NAME' written to $AWS_CONFIG_FILE"
-echo ""
-
-# ── SSO Login ──────────────────────────────────────────────────────────
-echo "Logging in via AWS SSO (a browser window will open)..."
-aws sso login --profile "$PROFILE_NAME"
-
-echo ""
-echo "OK: SSO login successful."
 echo ""
 
 # ── Verify identity ───────────────────────────────────────────────────
@@ -131,12 +219,13 @@ echo "Verifying AWS identity..."
 aws sts get-caller-identity --profile "$PROFILE_NAME"
 echo ""
 
-# ── EKS (optional): uncomment and set CLUSTER_NAME if this account has EKS
-# echo "Configuring kubectl for EKS cluster..."
-# aws eks update-kubeconfig --name CLUSTER_NAME --region $AWS_REGION --profile "$PROFILE_NAME"
-
+# ── Summary ────────────────────────────────────────────────────────────
 echo "======================="
 echo "DONE: Setup complete."
+echo ""
+echo "  Account  : $PROFILE_NAME"
+echo "  Role     : $SSO_ROLE"
+echo "  Profile  : $PROFILE_NAME"
 echo ""
 echo "To use this profile in your terminal, run:"
 echo ""
