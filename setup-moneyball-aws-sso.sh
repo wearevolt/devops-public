@@ -182,7 +182,7 @@ echo "Selected role  : $SSO_ROLE"
 echo ""
 
 # ── Build profile name ────────────────────────────────────────────────
-PROFILE_NAME="${ENV_NAME}-mb"
+PROFILE_NAME="${ENV_NAME}"
 
 # ── Write final profile to AWS config ─────────────────────────────────
 echo "Configuring AWS CLI profile '$PROFILE_NAME'..."
