@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # WeareVolt Internal AWS SSO setup script
-# Configures AWS SSO profile for WeareVolt internal accounts.
+# Configures AWS SSO profile and connects to the EKS cluster for the selected account.
+# Each account has its own EKS region and cluster name (edit the case block below if they change).
 # Automatically picks the highest-privilege role available to the user.
 # Usage: ./setup-internal-aws-sso.sh
 
@@ -36,22 +37,32 @@ case "$env_choice" in
     1)
         PROFILE_NAME="spice"
         ACCOUNT_ID="820345161825"
+        EKS_REGION="us-east-1"
+        CLUSTER_NAME="spice"
         ;;
     2)
         PROFILE_NAME="pjc"
         ACCOUNT_ID="646282686055"
+        EKS_REGION="us-east-2"
+        CLUSTER_NAME="pjc"
         ;;
     3)
         PROFILE_NAME="alex"
         ACCOUNT_ID="631170821846"
+        EKS_REGION="us-east-1"
+        CLUSTER_NAME=""
         ;;
     4)
         PROFILE_NAME="internal"
         ACCOUNT_ID="539247483493"
+        EKS_REGION="us-east-1"
+        CLUSTER_NAME="internal"
         ;;
     5)
         PROFILE_NAME="curation"
         ACCOUNT_ID="134726541233"
+        EKS_REGION="us-east-1"
+        CLUSTER_NAME=""
         ;;
     *)
         echo "ERROR: Invalid choice. Expected 1-5."
@@ -61,7 +72,11 @@ esac
 
 # ── Check prerequisites ───────────────────────────────────────────────
 if ! command -v aws &>/dev/null; then
-    echo "ERROR: 'aws' is not installed. Please install AWS CLI first."
+    echo "ERROR: 'aws' is not installed. Please install it first."
+    exit 1
+fi
+if [ -n "${CLUSTER_NAME:-}" ] && ! command -v kubectl &>/dev/null; then
+    echo "ERROR: 'kubectl' is not installed. Please install it first (required for EKS)."
     exit 1
 fi
 
@@ -219,15 +234,41 @@ echo "Verifying AWS identity..."
 aws sts get-caller-identity --profile "$PROFILE_NAME"
 echo ""
 
+# ── Configure EKS kubeconfig (only if cluster is set for this account) ──
+if [ -n "${CLUSTER_NAME:-}" ]; then
+    echo "Configuring kubectl for EKS cluster '$CLUSTER_NAME' in ${EKS_REGION:-$AWS_REGION}..."
+    aws eks update-kubeconfig \
+        --name "$CLUSTER_NAME" \
+        --region "${EKS_REGION:-$AWS_REGION}" \
+        --profile "$PROFILE_NAME" \
+        --alias "$CLUSTER_NAME"
+
+    echo ""
+    echo "OK: kubeconfig updated."
+    echo ""
+else
+    echo "No EKS cluster configured for this account, skipping kubeconfig."
+    echo ""
+fi
+
 # ── Summary ────────────────────────────────────────────────────────────
 echo "======================="
 echo "DONE: Setup complete."
 echo ""
-echo "  Account  : $PROFILE_NAME"
-echo "  Role     : $SSO_ROLE"
-echo "  Profile  : $PROFILE_NAME"
+echo "  Account     : $PROFILE_NAME"
+echo "  Role        : $SSO_ROLE"
+echo "  Profile     : $PROFILE_NAME"
+if [ -n "${CLUSTER_NAME:-}" ]; then
+    echo "  EKS cluster : $CLUSTER_NAME (${EKS_REGION:-$AWS_REGION})"
+fi
 echo ""
 echo "To use this profile in your terminal, run:"
 echo ""
 echo "  export AWS_PROFILE=$PROFILE_NAME"
 echo ""
+if [ -n "${CLUSTER_NAME:-}" ]; then
+    echo "To switch kubectl context later:"
+    echo ""
+    echo "  kubectx $CLUSTER_NAME"
+    echo ""
+fi
