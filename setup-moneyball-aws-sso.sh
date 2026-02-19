@@ -227,7 +227,8 @@ echo "Configuring kubectl for EKS cluster '$CLUSTER_NAME' in $AWS_REGION..."
 aws eks update-kubeconfig \
     --name "$CLUSTER_NAME" \
     --region "$AWS_REGION" \
-    --profile "$PROFILE_NAME"
+    --profile "$PROFILE_NAME" \
+    --alias "$CLUSTER_NAME"
 
 echo ""
 echo "OK: kubeconfig updated."
